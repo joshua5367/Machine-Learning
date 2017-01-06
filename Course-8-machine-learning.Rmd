@@ -1,0 +1,352 @@
+---
+title: "Prediction Assignment"
+author: "Choo Che Yon"
+date: "January 3, 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(caret)
+library(randomForest)#rf
+library(gbm)#gbm
+library(e1071)#svm
+library(RANN)#for predict
+```
+
+```{r Declare, echo=FALSE}
+ConvertToPercentage <- function(x){
+        format(round(x, 4) * 100, nsmall = 2)
+}
+```
+
+##Overview
+Collecting data is getting easier with emerging technology. Devices such as *Jawbone Up*, *Nike FuelBand*, and *Fitbit* can easily collects large amount of data about personal activity relatively inexpensively. This report will make use of the data collected from accelerometers on the belt, forearm, arm, and dumbell of 6 participants using those devices, to create a prediction model which predicts the type of actions they performed.
+
+
+##Getting Data
+The data used in this report is taken from http://groupware.les.inf.puc-rio.br/har, both training and testing set. The training set can be obtained from [the link here](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv), and testing set from [the link here](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv).
+
+```{r GetData_1}
+# Download training set
+download.file(url = "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv", 
+              destfile = "training.csv")
+
+# Download testing set
+download.file(url = "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv",
+              destfile = "testing.csv")
+
+# Getting downloaded data
+training <- read.csv("training.csv")
+testing <- read.csv("testing.csv")
+```
+
+
+##Exploratory Analysis
+There are **`r dim(training)[1]`** observations in the training set with **`r dim(training)[2]`** variables; and **`r dim(testing)[1]`** observations in the testing set. 
+
+
+In the training set, noticed that most of the columns were empty ('*kurtosis_roll_belt*', '*kurtosis_pitch_belt*', etc.) except when the column '*new_window*' is '*yes*'. With limited information about the dataset, these values do not seems important as most of them are empty. Therefore, I exclude these empty columns from the predictors. 
+
+```{r ExploreData_1}
+# remove the observations where "new_window" is "yes".
+training <- training[training$new_window != "yes",]
+
+# remove columns with NA or empty
+training[training == ""] <- NA
+training <- training[,colSums(is.na(training)) == 0]
+```
+
+Out of all the variables in the training set, some of them are not relevant (such as '*number*', '*user_name*', '*'raw_time*', etc., the first 7 columns of the training set) to predict the activity. Hence, they were removed from the list of potential predictors too.
+
+```{r ExploreData_2}
+# remove username, time information, etc. (the first 7 columns)
+training <- training[,-(1:7)]
+```
+
+After filtering potential predictors, there are **`r dim(training)[1]`** observations left in the training set with **`r dim(training)[2]`** variables.
+
+
+```{r ExploreData_3, echo=FALSE}
+data.frame(
+        Count = tapply(X = training$classe, 
+                       INDEX = training$classe, 
+                       FUN = length), 
+        Percentage = tapply(X = training$classe, 
+                            INDEX = training$classe, 
+                            FUN = function(x){
+                                    ConvertToPercentage(
+                                            length(x) / dim(training)[1])
+                        }
+))
+
+# The following variables are use for storing values to be used in the following 2 paragraphs only. Some of these will be execute again in the next code segment for the purpose of showing the it on the report.
+
+# Calculate the occurence of each group
+countClasse <- tapply(training$classe, training$classe, length)
+
+# Calculate the maximum occurence
+maxCountClasse <- max(countClasse)
+
+# Get the group name with maximum occurence
+maxClasseName <- names(countClasse[countClasse == max(countClasse)])
+
+# Get the group name that are not having maximum occurence
+otherClasseName <- names(countClasse[countClasse != max(countClasse)])
+
+# Calculate the mean of otherClasse
+otherClasseMean <- mean(countClasse[countClasse != max(countClasse)])
+```
+
+From the table above, noticed that there are **`r length(levels(training$classe))`** different types of exercise recorded, ***`r levels(training$classe)`***. Group ***`r maxClasseName`*** has roughly **`r ConvertToPercentage((maxCountClasse - otherClasseMean) / otherClasseMean)`%** more data compared to other groups. So, we expect the trained model to be slightly bias towards group ***`r maxClasseName`***.
+
+
+To reduce the bias, random undersampling method is used to randomly remove some data from groups ***`r maxClasseName`*** to make the training data more balance. This method is used instead of upsampling method is to prevent potential overfitting issue since upsampling requires to duplicate roughly **`r floor(maxCountClasse - otherClasseMean)`** observations (roughly **`r ConvertToPercentage(floor(maxCountClasse - otherClasseMean) / otherClasseMean)`%** more duplicated data) for each groups ***`r otherClasseName`***.
+
+
+```{r ExploreData_4}
+set.seed(111)
+
+# Calculate the occurence of each group
+countClasse <- tapply(X =  training$classe, 
+                      INDEX = training$classe, 
+                      FUN = length)
+
+# Calculate the maximum occurence
+maxCountClasse <- max(countClasse)
+
+# Get the group name with maximum occurence
+maxClasseName <- names(countClasse[countClasse == maxCountClasse])
+
+# Calculate the mean of groups that is not maximum (maximum is group A)
+otherClasseMean <- mean(countClasse[countClasse != maxCountClasse])
+
+# Samples the training data for group with maximum occurence that needs to be removed
+outSample <- sample(x = 1:maxCountClasse, 
+                   size = maxCountClasse - floor(otherClasseMean), 
+                   replace = FALSE)
+
+# Remove observations that is in outSample
+training <- training[-outSample,]
+
+# Check out the balanced data distribution
+table(training$classe)
+```
+
+
+##Preprocessing
+The training set is subsetted into 2 different sets, 60% for training and 40% as validation set.
+
+```{r Preprocessing_1}
+set.seed(222)
+
+# Split data into 60:40
+inTrain <- createDataPartition(training$classe, p = 0.6, list = FALSE)
+validation <- training[-inTrain,]
+training <- training[inTrain,]
+
+# Check out the size of training data set
+dim(training)
+
+# Check out the size of validation data set
+dim(validation)
+```
+
+With such a large number of variables in the training set, it would be best to investigate the relationship between variables in order to reduce the dimension of the training set hence reduce the complexity of the model.
+
+```{r Preprocessing_2}
+# Calculate the pca for training set
+preprocess_pca <- preProcess(subset(training, select=-classe), 
+                             method = "pca",
+                             thresh = .99)
+# Check out the pca
+preprocess_pca
+
+# Get new training data
+training_pca <- predict(preprocess_pca, training)
+```
+
+**`r dim(training)[2]`** variables has been reduced to **`r preprocess_pca$numComp`** principle components which captures **`r preprocess_pca$thresh*100`%** of the training set variance.
+
+
+##Modeling
+To get the best prediction model, I trained 4 different models using different methods, namely random forest (*rf*), gradient boosted machine (*gbm*), linear discriminant analysis model (*lda*) and support vector machine (*svm*). A comparison of accuracy is conducted at the end of model training to find the best model that fits the training data.
+
+
+Firstly, prepare the training scheme with 3 repeats of 10-fold cross validation (10-fold it is a good choice for the bias-variance trade-off). Seed is set to the same value **333** before training models is to make sure that each training process will get the same data partitions and repeats according to the training scheme.
+
+```{r Modeling_1}
+# Prepare training scheme
+control <- trainControl(method="repeatedcv", number=10, repeats = 3)
+```
+```{r Modeling_1_rf, cache=TRUE}
+# Random forest model
+set.seed(333)
+model_rf <- train(classe ~ ., 
+                  data = training_pca, 
+                  trControl = control, 
+                  method = "rf")
+```
+```{r Modeling_1_gbm, cache=TRUE, results="hide"}
+# Gradient boosted model
+set.seed(333)
+model_gbm <- train(classe ~ ., 
+                   data = training_pca, 
+                   trControl = control, 
+                   method = "gbm")
+```
+```{r Modeling_1_lda, cache=TRUE, results="hide"}
+# Linear discriminat analysis model
+set.seed(333)
+model_lda <- train(classe ~ ., 
+                   data = training_pca, 
+                   trControl = control, 
+                   method = "lda")
+```
+```{r Modeling_1_svm, cache=TRUE}
+# Support vector machine model
+set.seed(333)
+model_svm <- svm(classe ~ ., data = training_pca)
+```
+
+
+##Model Evaluation
+I used validation set to compare the 4 models created in the *Modeling* section. Since the pca is used while training, the validation set also needs to undergo the same process as training set to calculate the pca.
+
+```{r Evaluation_1}
+# Get new validation set
+validation_pca <- predict(preprocess_pca, validation)
+```
+
+Next, I calculated the accuracy for all the predictions on validation set for all models created in *Modeling* section. 
+
+```{r Evaluation_2, results="hide"}
+# Predict validation set with rf model
+pred_rf <- predict(model_rf, validation_pca)
+
+# Predict validation set with gbm model
+pred_gbm <- predict(model_gbm, validation_pca)
+
+# Predict validation set with lda model
+pred_lda <- predict(model_lda, validation_pca)
+
+# Predict validation set with svm model
+pred_svm <- predict(model_svm, validation_pca)
+```
+```{r Evaluation_3}
+# Calculate accuracy for predictions
+data.frame(
+        rf = confusionMatrix(validation_pca$classe, pred_rf)[[3]][1],
+        gbm = confusionMatrix(validation_pca$classe, pred_gbm)[[3]][1],
+        lda = confusionMatrix(validation_pca$classe, pred_lda)[[3]][1],
+        svm = confusionMatrix(validation_pca$classe, pred_svm)[[3]][1]
+)
+```
+
+From the table above, **model_rf** produced the highest accuracy (**`r ConvertToPercentage(confusionMatrix(validation_pca$classe, pred_rf)[[3]][1])`%**) among the models.
+
+
+##Model Extension
+Before choosing the final model, I tried to combine models and hope to get an even better classifier. Since lda's performance is below satisfactory, I tried to stack models for *rf*, *gbm* and *svm* only.
+
+
+First, prepare the training data for stacked model.
+
+```{r Extension_1}
+# Prepare training data for stacked model
+# rf + gbm
+pred_training_rfgbm <- data.frame(rf = pred_rf,
+                                  gbm = pred_gbm,
+                                  classe = validation_pca$classe)
+
+# rf + svm
+pred_training_rfsvm <- data.frame(rf = pred_rf,
+                                  svm = pred_svm,
+                                  classe = validation_pca$classe)
+
+# gbm + svm
+pred_training_gbmsvm <- data.frame(gbm = pred_gbm,
+                                   svm = pred_svm,
+                                   classe = validation_pca$classe)
+
+# rf + gbm + svm
+pred_training_rfgbmsvm <- data.frame(rf = pred_rf,
+                                     gbm = pred_gbm,
+                                     svm = pred_svm,
+                                     classe = validation_pca$classe)
+```
+
+Next, combines the models.
+
+```{r Extension_2, results="hide", cache=TRUE}
+# Stack models
+# rf + gbm
+model_com_rfgbm = train(classe ~ ., 
+                        data = pred_training_rfgbm, 
+                        method = "rf")
+
+# rf + svm
+model_com_rfsvm = train(classe ~ ., 
+                        data = pred_training_rfsvm, 
+                        method = "rf")
+
+# gbm + svm
+model_com_gbmsvm = train(classe ~ ., 
+                         data = pred_training_gbmsvm, 
+                         method = "rf")
+
+# rf + gbm + svm
+model_com_rfgbmsvm = train(classe ~ ., 
+                           data = pred_training_rfgbmsvm, 
+                           method = "rf")
+```
+
+Now the models training completed. I evaluated the performance of each models.
+
+```{r Extension_3, cache=TRUE}
+# Predict the output using stacked models
+# rf + gbm
+pred_com_rfgbm <- predict(model_com_rfgbm, pred_training_rfgbm)
+
+# rf + svm
+pred_com_rfsvm <- predict(model_com_rfsvm, pred_training_rfsvm)
+
+# gbm + svm
+pred_com_gbmsvm <- predict(model_com_gbmsvm, pred_training_gbmsvm)
+
+# rf + gbm + svm
+pred_com_rfgbmsvm <- predict(model_com_rfgbmsvm, pred_training_rfgbmsvm)
+
+# Calculate accuracy for predictions
+data.frame(
+        rfgbm = confusionMatrix(validation_pca$classe, pred_com_rfgbm)[[3]][1],
+        rfsvm = confusionMatrix(validation_pca$classe, pred_com_rfsvm)[[3]][1],
+        gbmsvm = confusionMatrix(validation_pca$classe, pred_com_gbmsvm)[[3]][1],
+        rfgbmsvm = confusionMatrix(validation_pca$classe, pred_com_rfgbmsvm)[[3]][1]
+)
+```
+
+The prediction accuracy for all the combined models are above **90%**. Their performance are quite on par with *model_rf*. Among all the combined models, the combination of *rf*, *gbm*, and *svm* (*model_com_rfgbmsvm*) is the highest (**`r ConvertToPercentage(confusionMatrix(validation_pca$classe, pred_com_rfgbmsvm)[[3]][1])`%**). which is
+**`r ConvertToPercentage(confusionMatrix(validation_pca$classe, pred_com_rfgbmsvm)[[3]][1] - confusionMatrix(validation_pca$classe, pred_rf)[[3]][1])`%** better than *model_rf*.
+
+
+The final model I chosed is **model_rf** instead of *model_com_rfgbmsvm* is due to the trade off of complexity and accuracy improvement. The combined model is too complex for that little accuracy improvement.
+
+
+##Model Testing
+Similar to validation, testing set also requires to be processed the same way as the training set.
+
+```{r Testing_1}
+# Get new testing set
+testing_pca <- predict(preprocess_pca, testing)
+
+# Predict activities for testing set with chosen model
+pred_testing <- predict(model_rf, testing_pca)
+
+# Check out the prediction result
+pred_testing
+```
+
+
+##Conclusion
+Training a prediction model is a tough process. It tooks hours to days for a model with 5 classes of roughly 18k observations. Nonetheless, the prediction capability is satisfactory. The overall accuracy of all the models is above 80% using validation set except for lda.
